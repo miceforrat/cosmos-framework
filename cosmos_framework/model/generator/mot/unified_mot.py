@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import json
+import hashlib
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -942,27 +944,40 @@ class PackedAttentionMoT(nn.Module):
         q, k = self._apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
         # q: [B,T,num_heads,head_dim], k: [B,T,num_kv_heads,head_dim]
 
-        # The KV cache stores tensors in the same BSHD layout that
-        # ``cosmos_framework.model.attention.attention`` expects, with the seq dim at axis 1.
-        if cache is not None:
-            k_full, v_full = cache.update(layer_idx, k, v)
+        # CUDA Graph decode uses fixed-capacity KV buffers. FlashAttention updates
+        # the current slot in place, avoiding shape-changing torch.cat allocations.
+        if cache is not None and cache.is_static:
+            if T != 1 or cache.cache_seqlens is None:
+                raise ValueError("Static ReasonerKVCache only supports one-token decode.")
+            key_cache = cache.keys[layer_idx]
+            value_cache = cache.values[layer_idx]
+            assert key_cache is not None and value_cache is not None
+            from flash_attn.flash_attn_interface import flash_attn_with_kvcache
+
+            out = flash_attn_with_kvcache(
+                q,
+                key_cache,
+                value_cache,
+                k=k,
+                v=v,
+                cache_seqlens=cache.cache_seqlens,
+                softmax_scale=self.scaling,
+                causal=False,
+            )
         else:
-            k_full, v_full = k, v
-        # k_full / v_full: [B, T_total, num_kv_heads, head_dim]
-
-        # is_causal must only be True when seq_q == seq_kv (prefill).  For
-        # decode (T=1, T_total > 1) the single query at the rightmost position
-        # attends to every cached key without any mask.
-        is_causal = T > 1 and k_full.shape[1] == T
-
-        out = imaginaire_attention(
-            query=q,  # [B,T,num_heads,head_dim]
-            key=k_full,  # [B,T_total,num_kv_heads,head_dim]
-            value=v_full,  # [B,T_total,num_kv_heads,head_dim]
-            is_causal=is_causal,
-            causal_type=CausalType.DontCare if is_causal else None,
-            scale=self.scaling,
-        )  # [B,T,num_heads,head_dim] (return_lse=False -> single Tensor)
+            if cache is not None:
+                k_full, v_full = cache.update(layer_idx, k, v)
+            else:
+                k_full, v_full = k, v
+            is_causal = T > 1 and k_full.shape[1] == T
+            out = imaginaire_attention(
+                query=q,
+                key=k_full,
+                value=v_full,
+                is_causal=is_causal,
+                causal_type=CausalType.DontCare if is_causal else None,
+                scale=self.scaling,
+            )
 
         return self.o_proj(out.reshape(B, T, H * D))  # type: ignore[union-attr]  # [B,T,hidden_size]
 
@@ -1793,6 +1808,9 @@ class ReasonerKVCache:
 
     keys: list[torch.Tensor | None]
     values: list[torch.Tensor | None]
+    cache_seqlens: torch.Tensor | None = None
+    static_seq_len: int | None = None
+    static_capacity: int | None = None
 
     @classmethod
     def empty(cls, num_layers: int) -> "ReasonerKVCache":
@@ -1804,9 +1822,57 @@ class ReasonerKVCache:
 
     @property
     def seq_len(self) -> int:
+        if self.static_seq_len is not None:
+            return self.static_seq_len
         if self.keys[0] is None:
             return 0
         return int(self.keys[0].shape[1])
+
+    @property
+    def is_static(self) -> bool:
+        return self.static_capacity is not None
+
+    def make_static(self, capacity: int) -> None:
+        """Replace growing KV tensors with fixed-capacity graph-safe buffers."""
+        seq_len = self.seq_len
+        if capacity < seq_len:
+            raise ValueError(f"Static KV capacity {capacity} is smaller than current length {seq_len}.")
+        for i, (key, value) in enumerate(zip(self.keys, self.values, strict=True)):
+            if key is None or value is None:
+                raise ValueError("Cannot make an unpopulated ReasonerKVCache static.")
+            static_key = key.new_empty((key.shape[0], capacity, key.shape[2], key.shape[3]))
+            static_value = value.new_empty((value.shape[0], capacity, value.shape[2], value.shape[3]))
+            static_key[:, :seq_len].copy_(key)
+            static_value[:, :seq_len].copy_(value)
+            self.keys[i] = static_key
+            self.values[i] = static_value
+        first_key = self.keys[0]
+        assert first_key is not None
+        self.cache_seqlens = torch.full(
+            (first_key.shape[0],), seq_len, dtype=torch.int32, device=first_key.device
+        )
+        self.static_seq_len = seq_len
+        self.static_capacity = capacity
+
+    def clone_static(self) -> "ReasonerKVCache":
+        if not self.is_static or self.cache_seqlens is None:
+            raise ValueError("clone_static() requires a static cache.")
+        return ReasonerKVCache(
+            keys=[None if key is None else key.clone() for key in self.keys],
+            values=[None if value is None else value.clone() for value in self.values],
+            cache_seqlens=self.cache_seqlens.clone(),
+            static_seq_len=self.static_seq_len,
+            static_capacity=self.static_capacity,
+        )
+
+    def advance(self, tokens: int = 1) -> None:
+        if not self.is_static or self.cache_seqlens is None or self.static_seq_len is None:
+            raise ValueError("advance() requires a static cache.")
+        assert self.static_capacity is not None
+        if self.static_seq_len + tokens > self.static_capacity:
+            raise ValueError("Static Reasoner KV cache capacity exceeded.")
+        self.cache_seqlens.add_(tokens)
+        self.static_seq_len += tokens
 
     def update(
         self,
@@ -1815,6 +1881,8 @@ class ReasonerKVCache:
         v: torch.Tensor,  # [B,T_new,num_kv_heads,head_dim]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Append new K/V along the seq dim and return the full cached K/V."""
+        if self.is_static:
+            raise RuntimeError("Static ReasonerKVCache must use flash_attn_with_kvcache.")
         cached_k = self.keys[layer_idx]
         cached_v = self.values[layer_idx]
         if cached_k is None or cached_v is None:
@@ -1829,6 +1897,31 @@ class ReasonerKVCache:
         for i in range(self.num_layers):
             self.keys[i] = None
             self.values[i] = None
+        self.cache_seqlens = None
+        self.static_seq_len = None
+        self.static_capacity = None
+
+
+@dataclass
+class _PersistentReasonerGraph:
+    """One-token decode graph plus every address captured by that graph."""
+
+    graph: torch.cuda.CUDAGraph
+    cache: ReasonerKVCache
+    static_input: torch.Tensor
+    static_position_ids: torch.Tensor
+    finished: torch.Tensor
+    pad_tensor: torch.Tensor
+    eos_tensor: torch.Tensor | None
+    initial_seq_len: int
+    capacity: int
+
+
+# Profiling-only cache. A key includes the model, GC stream and all captured
+# shapes, so a graph is never replayed on another Green Context or request
+# shape. Keeping this module-local also keeps normal serving unchanged unless
+# COSMOS_REASONER_CUDA_GRAPH_PERSISTENT=1 is explicitly selected.
+_PERSISTENT_REASONER_GRAPHS: dict[tuple[Any, ...], _PersistentReasonerGraph] = {}
 
 
 def _impl_reasoner_forward(
@@ -2035,6 +2128,141 @@ def _all_ranks_finished(finished: torch.Tensor) -> bool:
         return bool(flag.item())
     return bool(local)
 
+
+def _reasoner_cuda_graph_decode(
+    *,
+    model: nn.Module,
+    causal_lm: nn.Module,
+    cache: ReasonerKVCache,
+    next_token: torch.Tensor,
+    finished: torch.Tensor,
+    pad_tensor: torch.Tensor,
+    eos_tensor: torch.Tensor | None,
+    base_mrope_position_ids: torch.Tensor | None,
+    output_buf: torch.Tensor,
+    max_new_tokens: int,
+    fixed_length_decode: bool,
+) -> int:
+    """Capture one greedy decode step and replay it with recurrent static inputs."""
+    if max_new_tokens == 1:
+        return 1
+    initial_seq_len = cache.seq_len
+    capacity = initial_seq_len + max_new_tokens - 1
+    persistent = os.environ.get("COSMOS_REASONER_CUDA_GRAPH_PERSISTENT") == "1"
+    stream_ptr = int(torch.cuda.current_stream().cuda_stream)
+    eos_key = None if eos_tensor is None else tuple(int(v) for v in eos_tensor.tolist())
+    graph_key = (
+        id(model),
+        id(causal_lm),
+        next_token.device.index,
+        stream_ptr,
+        tuple(next_token.shape),
+        next_token.dtype,
+        initial_seq_len,
+        capacity,
+        None if base_mrope_position_ids is None else tuple(base_mrope_position_ids.shape),
+        eos_key,
+    )
+    runtime = _PERSISTENT_REASONER_GRAPHS.get(graph_key) if persistent else None
+
+    if runtime is None:
+        cache.make_static(capacity)
+        assert cache.cache_seqlens is not None
+        static_input = next_token.unsqueeze(1).clone()
+        if base_mrope_position_ids is None:
+            static_position_ids = torch.full(
+                (next_token.shape[0], 1), initial_seq_len, dtype=torch.long, device=next_token.device
+            )
+        else:
+            static_position_ids = (base_mrope_position_ids + initial_seq_len).clone()
+        static_finished = finished.clone()
+        static_pad = pad_tensor.clone()
+        static_eos = None if eos_tensor is None else eos_tensor.clone()
+
+        # Materialize lazy kernels and allocator state before stream capture.
+        # Warmup only overwrites the first free KV slot and never advances it.
+        for _ in range(2):
+            warm_hidden = model.reasoner_forward(static_input, cache=cache, position_ids=static_position_ids)
+            torch.argmax(causal_lm.lm_head(warm_hidden[:, -1, :]), dim=-1)
+        torch.cuda.current_stream().synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        # torch.cuda.graph() otherwise switches to PyTorch's process-global
+        # default side stream.  That stream belongs to the primary context and
+        # silently escapes the Green Context even though our caller is inside
+        # torch.cuda.stream(gc_external_stream).  Capture explicitly on the
+        # current GC stream so every replay retains the SM partition.
+        capture_stream = torch.cuda.current_stream()
+        with torch.cuda.graph(
+            graph,
+            stream=capture_stream,
+            capture_error_mode="thread_local",
+        ):
+            hidden = model.reasoner_forward(static_input, cache=cache, position_ids=static_position_ids)
+            logits = causal_lm.lm_head(hidden[:, -1, :])
+            graph_next_token = torch.argmax(logits, dim=-1)
+            graph_next_token = torch.where(static_finished, static_pad, graph_next_token)
+            if static_eos is not None:
+                static_finished.logical_or_((graph_next_token.unsqueeze(-1) == static_eos).any(dim=-1))
+            static_input.copy_(graph_next_token.unsqueeze(1))
+            cache.cache_seqlens.add_(1)
+            static_position_ids.add_(1)
+        runtime = _PersistentReasonerGraph(
+            graph=graph,
+            cache=cache,
+            static_input=static_input,
+            static_position_ids=static_position_ids,
+            finished=static_finished,
+            pad_tensor=static_pad,
+            eos_tensor=static_eos,
+            initial_seq_len=initial_seq_len,
+            capacity=capacity,
+        )
+        if persistent:
+            _PERSISTENT_REASONER_GRAPHS[graph_key] = runtime
+    else:
+        # The graph owns fixed-address KV storage. Copy this request's fresh
+        # prefill prefix into it; never replay against the previous request's KV.
+        for dst_key, dst_value, src_key, src_value in zip(
+            runtime.cache.keys, runtime.cache.values, cache.keys, cache.values, strict=True
+        ):
+            if dst_key is None or dst_value is None or src_key is None or src_value is None:
+                raise ValueError("Persistent CUDA Graph received an unpopulated KV cache.")
+            if tuple(src_key.shape) != tuple(dst_key[:, :initial_seq_len].shape):
+                raise ValueError("Persistent CUDA Graph KV shape changed between requests.")
+            dst_key[:, :initial_seq_len].copy_(src_key)
+            dst_value[:, :initial_seq_len].copy_(src_value)
+
+    # Capture itself executes once. Reset every recurrent input before this
+    # request's first replay, including when the runtime has just been created.
+    assert runtime.cache.cache_seqlens is not None
+    runtime.cache.cache_seqlens.fill_(initial_seq_len)
+    runtime.cache.static_seq_len = initial_seq_len
+    runtime.static_input.copy_(next_token.unsqueeze(1))
+    if base_mrope_position_ids is None:
+        runtime.static_position_ids.fill_(initial_seq_len)
+    else:
+        runtime.static_position_ids.copy_(base_mrope_position_ids + initial_seq_len)
+    runtime.finished.copy_(finished)
+    runtime.pad_tensor.copy_(pad_tensor)
+    if runtime.eos_tensor is not None and eos_tensor is not None:
+        runtime.eos_tensor.copy_(eos_tensor)
+
+    graph = runtime.graph
+    static_input = runtime.static_input
+    static_finished = runtime.finished
+
+    num_generated = 1
+    for output_idx in range(1, max_new_tokens):
+        if not fixed_length_decode and eos_tensor is not None and bool(static_finished.all()):
+            break
+        graph.replay()
+        output_buf[:, output_idx].copy_(static_input[:, 0])
+        num_generated += 1
+    runtime.cache.static_seq_len = initial_seq_len + num_generated - 1
+    finished.copy_(static_finished)
+
+    return num_generated
 
 @torch.no_grad()
 def _impl_generate_reasoner_text(
@@ -2311,86 +2539,154 @@ def _impl_generate_reasoner_text(
     if eos_tensor is not None:
         finished |= (next_token.unsqueeze(-1) == eos_tensor).any(dim=-1)
 
-    torch.cuda.synchronize()
+    # Attribution-only profiling mode: keep EOS bookkeeping and pad-fill
+    # semantics on the GPU, but do not copy finished.all() back to the CPU on
+    # every token. This deliberately runs exactly max_new_tokens steps and is
+    # disabled by default so normal inference retains its early-exit behavior.
+    fixed_length_decode = os.environ.get("COSMOS_REASONER_FIXED_LENGTH_DECODE") == "1"
+    use_cuda_graph = os.environ.get("COSMOS_REASONER_CUDA_GRAPH") == "1"
+    use_static_kv_eager = os.environ.get("COSMOS_REASONER_STATIC_KV_EAGER") == "1"
+    if use_cuda_graph and use_static_kv_eager:
+        raise ValueError("Reasoner CUDA Graph and static-KV eager modes are mutually exclusive.")
+    if use_cuda_graph:
+        if do_sample or repetition_penalty != 1.0 or presence_penalty != 0.0:
+            raise ValueError("Reasoner CUDA Graph currently supports greedy decode without penalties only.")
+        if not input_ids.is_cuda:
+            raise ValueError("Reasoner CUDA Graph requires CUDA input tensors.")
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            raise ValueError("Reasoner CUDA Graph prototype currently supports single-process inference only.")
+    if use_static_kv_eager:
+        if not input_ids.is_cuda:
+            raise ValueError("Reasoner static-KV eager mode requires CUDA input tensors.")
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            raise ValueError("Reasoner static-KV eager prototype currently supports single-process inference only.")
+
+    torch.cuda.current_stream().synchronize()
     _prefill_time = time.time() - _prefill_start
     log.info(f"[generate_reasoner_text] prefill time: {_prefill_time:.2f} sec")
 
-    _decode_start = time.time()
     # Pre-allocate the full ``[B, max_new_tokens]`` output buffer and write
     # per-step into it via scalar column indexing; this avoids the per-step
     # ``next_token.unsqueeze(1)`` alloc, the Python list append, and the
     # final ``torch.cat`` over the accumulated chunks.  We slice the buffer
     # at the end to honor any early-exit shrinkage.
-    output_buf = torch.empty(B, max_new_tokens, dtype=next_token.dtype, device=device)
-    output_buf[:, 0] = next_token
-    num_generated = 1
 
-    # Decode — feed one token at a time, attending to all cached K/V.
-    for _ in range(max_new_tokens - 1):
-        # Cross-rank early-exit: only break when every sample on every
-        # rank has emitted EOS.  Under FSDP the loop body all-gathers
-        # full weights every step, so a per-rank ``break`` would hang
-        # the slower ranks on a collective the faster ranks never enter.
-        # See ``_all_ranks_finished`` for the full rationale; on
-        # single-process / non-distributed runs this reduces to the
-        # original ``bool(finished.all())`` check.  When no ``eos_ids``
-        # are configured ``finished`` stays all-False forever and the
-        # check can never trigger, so we skip the per-step host-device
-        # sync from ``_all_ranks_finished``'s ``.item()`` entirely.
-        if eos_tensor is not None and _all_ranks_finished(finished):
-            break
-        step_input = next_token.unsqueeze(1)  # [B,1]
-        position_ids = None
-        if base_mrope_position_ids is not None:
-            # Decode-step mrope position = cache.seq_len + per-sample delta.
-            # cache.seq_len already grew by one with each previous decode step,
-            # so the Nth decoded token (N>=0) lands at absolute position
-            # ``T_prompt + N + delta``, matching HF's ``cache_position[0] + rope_deltas``.
-            # Broadcasting a Python int onto the pre-expanded ``[3,B,1]``
-            # view produces a fresh contiguous ``[3,B,1]`` long tensor in a
-            # single elementwise kernel — strictly cheaper than the prior
-            # ``torch.full + add + unsqueeze + expand`` chain.
-            position_ids = base_mrope_position_ids + cache.seq_len
-        hidden = model.reasoner_forward(step_input, cache=cache, position_ids=position_ids)  # [B,1,hidden_size]
-        logits = causal_lm.lm_head(hidden[:, -1, :])  # [B,vocab_size]
-        next_token = _sample_next_token(
-            logits,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            seen_mask=seen_mask,
-            output_seen_mask=output_seen_mask,
-            generator=generator,
-        )  # [B]
-        # Force pad on already-finished samples; finished stays True afterwards.
-        # ``pad_tensor`` is hoisted above so we avoid the per-step
-        # ``torch.full_like(next_token, pad_token_id)`` allocation.
-        next_token = torch.where(finished, pad_tensor, next_token)
-        # Record (post-pad) emitted token in both penalty histories. Finished
-        # samples write pad_token_id, which is dead state and harmless.
-        if seen_mask is not None:
-            seen_mask.scatter_(1, next_token.unsqueeze(1), True)
-        if output_seen_mask is not None:
-            output_seen_mask.scatter_(1, next_token.unsqueeze(1), True)
-        if eos_tensor is not None:
-            # Vectorized EOS comparison: broadcast ``next_token`` (``[B,1]``)
-            # against ``eos_tensor`` (``[E]``) and reduce-any across the
-            # small E dim.  Equivalent to the previous Python OR chain
-            # over ``eos_ids`` but builds only one transient tensor and a
-            # single reduce, and updates ``finished`` in place.
-            finished |= (next_token.unsqueeze(-1) == eos_tensor).any(dim=-1)
-        output_buf[:, num_generated] = next_token
-        num_generated += 1
+    from cosmos_framework.runtime.regions import runtime_region
+
+    with runtime_region("reasoner_decode"):
+        _decode_start = time.time()
+        output_buf = torch.empty(B, max_new_tokens, dtype=next_token.dtype, device=device)
+        output_buf[:, 0] = next_token
+        num_generated = 1
+
+        if use_cuda_graph:
+            num_generated = _reasoner_cuda_graph_decode(
+                model=model,
+                causal_lm=causal_lm,
+                cache=cache,
+                next_token=next_token,
+                finished=finished,
+                pad_tensor=pad_tensor,
+                eos_tensor=eos_tensor,
+                base_mrope_position_ids=base_mrope_position_ids,
+                output_buf=output_buf,
+                fixed_length_decode=fixed_length_decode,
+                max_new_tokens=max_new_tokens,
+            )
+        else:
+            # Attribution baseline between the original dynamic-KV eager path
+            # and CUDA Graph replay. It deliberately keeps the Python
+            # one-token loop below while matching the graph path's fixed KV
+            # storage and flash_attn_with_kvcache backend.
+            if use_static_kv_eager and max_new_tokens > 1:
+                cache.make_static(cache.seq_len + max_new_tokens - 1)
+            # Decode — feed one token at a time, attending to all cached K/V.
+            for _ in range(max_new_tokens - 1):
+                # Cross-rank early-exit: only break when every sample on every
+                # rank has emitted EOS.  Under FSDP the loop body all-gathers
+                # full weights every step, so a per-rank ``break`` would hang
+                # the slower ranks on a collective the faster ranks never enter.
+                # See ``_all_ranks_finished`` for the full rationale; on
+                # single-process / non-distributed runs this reduces to the
+                # original ``bool(finished.all())`` check.  When no ``eos_ids``
+                # are configured ``finished`` stays all-False forever and the
+                # check can never trigger, so we skip the per-step host-device
+                # sync from ``_all_ranks_finished``'s ``.item()`` entirely.
+                if (
+                    not fixed_length_decode
+                    and eos_tensor is not None
+                    and _all_ranks_finished(finished)
+                ):
+                    break
+                step_input = next_token.unsqueeze(1)  # [B,1]
+                position_ids = None
+                if base_mrope_position_ids is not None:
+                    # Decode-step mrope position = cache.seq_len + per-sample delta.
+                    # cache.seq_len already grew by one with each previous decode step,
+                    # so the Nth decoded token (N>=0) lands at absolute position
+                    # ``T_prompt + N + delta``, matching HF's ``cache_position[0] + rope_deltas``.
+                    # Broadcasting a Python int onto the pre-expanded ``[3,B,1]``
+                    # view produces a fresh contiguous ``[3,B,1]`` long tensor in a
+                    # single elementwise kernel — strictly cheaper than the prior
+                    # ``torch.full + add + unsqueeze + expand`` chain.
+                    position_ids = base_mrope_position_ids + cache.seq_len
+                hidden = model.reasoner_forward(step_input, cache=cache, position_ids=position_ids)  # [B,1,hidden_size]
+                if use_static_kv_eager:
+                    # flash_attn_with_kvcache writes K/V at cache_seqlens but
+                    # does not advance the caller-owned sequence length.
+                    cache.advance()
+                logits = causal_lm.lm_head(hidden[:, -1, :])  # [B,vocab_size]
+                next_token = _sample_next_token(
+                    logits,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    seen_mask=seen_mask,
+                    output_seen_mask=output_seen_mask,
+                    generator=generator,
+                )  # [B]
+                # Force pad on already-finished samples; finished stays True afterwards.
+                # ``pad_tensor`` is hoisted above so we avoid the per-step
+                # ``torch.full_like(next_token, pad_token_id)`` allocation.
+                next_token = torch.where(finished, pad_tensor, next_token)
+                # Record (post-pad) emitted token in both penalty histories. Finished
+                # samples write pad_token_id, which is dead state and harmless.
+                if seen_mask is not None:
+                    seen_mask.scatter_(1, next_token.unsqueeze(1), True)
+                if output_seen_mask is not None:
+                    output_seen_mask.scatter_(1, next_token.unsqueeze(1), True)
+                if eos_tensor is not None:
+                    # Vectorized EOS comparison: broadcast ``next_token`` (``[B,1]``)
+                    # against ``eos_tensor`` (``[E]``) and reduce-any across the
+                    # small E dim.  Equivalent to the previous Python OR chain
+                    # over ``eos_ids`` but builds only one transient tensor and a
+                    # single reduce, and updates ``finished`` in place.
+                    finished |= (next_token.unsqueeze(-1) == eos_tensor).any(dim=-1)
+                output_buf[:, num_generated] = next_token
+                num_generated += 1
 
     new_tokens_tensor = output_buf[:, :num_generated]  # [B,T_new]
 
-    torch.cuda.synchronize()
+    torch.cuda.current_stream().synchronize()
     _decode_time = time.time() - _decode_start
     log.info(f"[generate_reasoner_text] decode time: {_decode_time:.2f} sec, number of tokens: {num_generated}")
     log.info(f"[generate_reasoner_text] average decode time per token: {_decode_time * 1e3 / num_generated:.2f} ms")
+
+    # Correctness-only instrumentation. This synchronization and D2H copy are
+    # deliberately after the decode timer/region, so they cannot change the
+    # measured CUDA-event duration. Hash generated token ids rather than text
+    # to detect tokenizer-normalization-hidden differences.
+    if os.environ.get("COSMOS_REASONER_VALIDATE_TOKENS") == "1":
+        token_bytes = new_tokens_tensor.detach().cpu().contiguous().numpy().tobytes()
+        token_sha256 = hashlib.sha256(token_bytes).hexdigest()
+        log.info(
+            "[generate_reasoner_text] validation "
+            f"new_tokens_shape={tuple(new_tokens_tensor.shape)} "
+            f"dtype={new_tokens_tensor.dtype} sha256={token_sha256}"
+        )
 
     if return_only_new_tokens:
         return new_tokens_tensor
