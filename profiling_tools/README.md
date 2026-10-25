@@ -16,6 +16,8 @@ profiling_tools/
 
 - 当前综合实验结论：`docs/cosmos3_architecture_decode_colocation_study.md`
 - vLLM Reasoner + Generator 统一调度新方案：`docs/unified_vllm_generator_colocation_plan.md`
+- Gate 3 GC stream 绑定证据与改造面评估：`docs/gate_3_green_context_stream_binding.md`
+- Reasoner-only vLLM 阶段 1 验证：`docs/vllm_reasoner_stage1.md`
 - Reasoner decode/GC 详细实现：`docs/cosmos3_reasoner_decode_colocation.md`
 - cold/warm SM scaling：`docs/cold_warm_sm_scaling.md`
 - Nsys/NCU 与 Roofline：`docs/nsys_ncu.md`
@@ -34,6 +36,10 @@ python -m profiling_tools.runners.colocate_decode_t2v
 `sys.path`，也是过去产生双层 `profiling_tools/profiling_tools/` 兼容副本的原因。
 
 This directory contains non-invasive runtime wrappers for profiling four Cosmos3-Edge tasks:
+
+The single-process vLLM/vLLM-Omni investigation starts with
+[`docs/gate_minus1_unified_environment.md`](docs/gate_minus1_unified_environment.md) and
+[`docs/gate_0_5_memory_budget.md`](docs/gate_0_5_memory_budget.md).
 
 - T2I
 - T2V

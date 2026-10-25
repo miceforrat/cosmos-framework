@@ -753,7 +753,7 @@ serial_gpu_sum
   = decode partitioned-alone CUDA event
   + T2V partitioned-alone CUDA event
 
-serial_host_wall
+partition_serial_host_wall
   = Reasoner-alone decode region 的实测 host wall
   + full T2V-alone request 的实测 host wall
 
@@ -762,7 +762,7 @@ serial_end_to_end_wall_diagnostic
   = 包含 prefill，仅作诊断，不用于吞吐计算
 ```
 
-前者便于分析纯 GPU 工作。serial_host_wall 与 full-overlap 的 colocated
+前者便于分析纯 GPU 工作。partition_serial_host_wall 与 full-overlap 的 colocated
 host_wall 使用对称边界，二者都只覆盖 decode + full T2V，并包含对应区间内
 的 CPU/launch/synchronization 开销。
 
@@ -774,14 +774,17 @@ full-generator 模式下：
 colocated_makespan = max(T_decode_colocated, T_t2v_colocated)
 ```
 
-报告：
+同分区 alone 的 host-wall 比值只能报告为重叠效率；正式吞吐收益必须另外使用两个 workload 各自独占 full SM 的串行 host wall：
 
 ```text
-throughput_gain_gpu_sum
+throughput_gain_gpu_sum  # diagnostic only
   = serial_gpu_sum / colocated_makespan
 
-throughput_gain_host_wall
-  = serial_host_wall / colocated host wall
+partition_overlap_efficiency_host_wall
+  = partition_serial_host_wall / colocated host wall
+
+throughput_gain_vs_full_sm_serial
+  = (decode_full_sm_host_wall + generator_full_sm_host_wall) / colocated host wall
 
 这里的两个 wall 都由 time.perf_counter 实测，不是由两个 GPU duration
 取 max 得到。只有 colocated_makespan 使用
@@ -996,9 +999,10 @@ python -m profiling_tools.runners.colocate_decode_t2v
     balance_ratio_decode_over_t2v = decode_alone / t2v_alone
     decode_slowdown               = decode_colocated / decode_alone
     t2v_slowdown                  = t2v_colocated / t2v_alone
-    throughput_gain_host_wall     = matched serial host wall / colocated host wall
+    partition_overlap_efficiency_host_wall = matched partitioned-alone host wall / colocated host wall
+    throughput_gain_vs_full_sm_serial = matched full-SM serial host wall / colocated host wall
 
-其中 balance ratio 越接近 1，吞吐收益越能代表真正的时间配平共置。
+其中 balance ratio 越接近 1，同分区重叠效率越接近真正的时间配平共置。
 
 ## 16.7 Reasoner decode × T2I
 
@@ -1060,8 +1064,8 @@ Runner 新增：
 - 所有单元基本配平，alone 时间最大偏差约 8%，多数在 3% 内；
 - eager 的双向干扰在四种分区下都很大且近似不随 SM 比例变化；
 - graph 下 T2I 序列仅变慢约 1.7%--4.0%，decode 仅变慢约 7%--9%；
-- graph 的配平吞吐收益为 1.79--1.86x，接近理想 2x；
-- eager 只有 1.08--1.11x，说明简单增加或减少任一侧 SM 无法解决主要干扰。
+- graph 的配平同分区重叠效率为 1.79--1.86x，接近理想 overlap 的 2x；
+- eager 的同分区重叠效率只有 1.08--1.11x，说明简单增加或减少任一侧 SM 无法解决主要干扰。
 
 这种分区不敏感、实现敏感的差异强烈支持 host/driver launch 提交竞争
 是 eager 路径主要瓶颈之一，而不是单纯的 SM 算力竞争。该解释仍属于基于

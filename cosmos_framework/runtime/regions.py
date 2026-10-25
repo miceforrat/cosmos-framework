@@ -12,6 +12,15 @@ _REGION_FACTORY: ContextVar[RegionFactory | None] = ContextVar(
 )
 
 
+# Optional CUDA stream identity supplied by a runtime region controller.
+# This is context-local so concurrent workload threads cannot overwrite each
+# other's expected stream. Model code can use it to verify CUDA Graph capture.
+_EXPECTED_CUDA_STREAM_PTR: ContextVar[int | None] = ContextVar(
+    "cosmos_expected_cuda_stream_ptr",
+    default=None,
+)
+
+
 def runtime_region(name: str) -> ContextManager[None]:
     factory = _REGION_FACTORY.get()
     if factory is None:
@@ -27,3 +36,15 @@ def install_region_factory(
 
 def reset_region_factory(token: Token[RegionFactory | None]) -> None:
     _REGION_FACTORY.reset(token)
+
+
+def expected_cuda_stream_ptr() -> int | None:
+    return _EXPECTED_CUDA_STREAM_PTR.get()
+
+
+def install_expected_cuda_stream_ptr(stream_ptr: int) -> Token[int | None]:
+    return _EXPECTED_CUDA_STREAM_PTR.set(int(stream_ptr))
+
+
+def reset_expected_cuda_stream_ptr(token: Token[int | None]) -> None:
+    _EXPECTED_CUDA_STREAM_PTR.reset(token)

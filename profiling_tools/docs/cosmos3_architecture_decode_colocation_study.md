@@ -520,6 +520,18 @@ profiling_results/plots/speedup_vs_sm_ratio.png
 profiling_results/plots/component_time_breakdown.png
 ```
 
+agentic prompt upsampling + T2I 数据与图（左图为 Reasoner prefill/decode，右图为 T2I Generator 的 `condition_prepare`、`diffusion_sampling` 和 `vae_decode`）：
+
+```text
+profiling_results/sm_scaling_agentic_phased_p3_on.csv
+profiling_results/plots_local_agentic_phased_p3_on/local_agentic_component_time_breakdown_measured.png
+profiling_results/plots_local_agentic_phased_p3_on/local_agentic_speedup_vs_sm_count_measured.png
+profiling_results/plots_local_agentic_phased_p3_on/local_agentic_speedup_vs_sm_ratio_measured.png
+profiling_results/plots_local_agentic_phased_p3_on/local_agentic_component_time_breakdown_cold.png
+profiling_results/plots_local_agentic_phased_p3_on/local_agentic_speedup_vs_sm_count_cold.png
+profiling_results/plots_local_agentic_phased_p3_on/local_agentic_speedup_vs_sm_ratio_cold.png
+```
+
 agentic rich02 T2V 数据与图：
 
 ```text
@@ -643,115 +655,93 @@ fd71c838c5fc98cc0632c94949034e13b19fde636ed48c3fc459ec382da00021
 
 ### 7.1 指标与实验结构
 
-每个矩阵点都先在相同 GC partition 上分别测：
+每个矩阵点先在完全相同的 GC partition 上分别测量 `decode_alone` 和 `generator_alone`，再通过 barrier 同时进入各自 GC stream，测量 `decode_colocated` 和 `generator_colocated`。
 
-```text
-decode_alone
-generator_alone
-```
-
-再让两者通过 barrier 同时进入各自 GC stream，测：
-
-```text
-decode_colocated
-generator_colocated
-colocated_makespan = max(两侧 GPU region duration)
-```
-
-指标：
+本节只报告实测干扰：
 
 ```text
 decode_slowdown    = decode_colocated / decode_alone
 generator_slowdown = generator_colocated / generator_alone
-serial_gpu_sum     = decode_alone + generator_alone
-throughput_gain    = serial_gpu_sum / colocated_makespan
 ```
 
-`host_wall` 由 `time.perf_counter()` 实测，不是取两侧时间的 max。`serial_host_wall` 采用 decode region host wall 加完整 generator host wall；包含 prefill 的 `serial_end_to_end_wall_diagnostic` 只用于诊断，不能作为同口径吞吐基线。
+slowdown 大于 1 表示共置后变慢。alone 与 colocated 必须使用同一个 partition；本节不根据这些矩阵推导或报告 throughput gain。
+
+当前正式矩阵是每个实现/分区一次共置运行，共 12 个矩阵点，而不是“每个分区两个覆盖方向”的 24 组实验。一次运行中只有较短 workload 被较长 workload 全程覆盖；较长侧的整体 slowdown 会被独占尾段稀释。但历史上确实通过选择不同 partition 端点测试过两个覆盖方向：graph R10:G160 中 Reasoner 覆盖 T2V，graph R50:G120 中 T2V 覆盖 Reasoner；这两个历史 `full_overlap` 结果与正式矩阵对应点一致。当前 static_eager 的分区扫描也跨过了两个覆盖方向；eager 的四个现有点则均为 Reasoner 覆盖 T2V，尚缺 T2V 覆盖 Reasoner 的端点。
 
 runner 和汇总脚本：
 
 ```text
-profiling_tools/colocate_decode_t2v.py
+profiling_tools/runners/colocate_decode_t2v.py
 profiling_tools/scripts/run_decode_t2v_impact_matrix.sh
 profiling_tools/scripts/run_decode_t2i_impact_matrix.sh
 profiling_tools/analysis/summarize_decode_t2v_impact_matrix.py
 ```
 
-### 7.2 T2V × LLM
+### 7.2 T2V × LLM：全部分区的同次共置 slowdown
 
 正式汇总：
 
 ```text
-profiling_results/decode_t2v_impact_matrix/summary.csv
 profiling_results/decode_t2v_impact_matrix/summary_all_implementations.csv
 profiling_results/decode_t2v_impact_matrix/*_matrix01.log
 ```
 
-| Decode | actual R:G SM | alone：Decode/T2V（s） | slowdown：Decode/T2V | makespan（s） | throughput gain |
-|---|---:|---:|---:|---:|---:|
-| eager | 10:160 | 33.970 / 22.248 | 1.144 / 1.031 | 38.865 | 1.446x |
-| eager | 18:152 | 30.447 / 23.063 | 1.055 / 1.034 | 32.132 | 1.665x |
-| eager | 34:136 | 29.433 / 25.169 | 1.062 / 1.033 | 31.245 | 1.747x |
-| eager | 50:120 | 29.068 / 27.365 | 1.053 / 1.035 | 30.618 | 1.843x |
-| graph | 10:160 | 29.727 / 22.355 | 1.148 / 1.024 | 34.140 | 1.525x |
-| graph | 18:152 | 17.765 / 23.098 | 1.204 / 1.029 | 23.760 | 1.720x |
-| graph | 34:136 | 10.603 / 25.254 | 1.170 / 1.016 | 25.655 | 1.398x |
-| graph | 50:120 | 8.395 / 27.461 | 1.207 / 1.013 | 27.826 | 1.289x |
-| static_eager | 10:160 | 32.343 / 22.249 | 1.153 / 1.028 | 37.279 | 1.464x |
-| static_eager | 18:152 | 21.992 / 23.096 | 1.191 / 1.032 | 26.192 | 1.721x |
-| static_eager | 34:136 | 20.662 / 25.260 | 1.134 / 1.029 | 26.002 | 1.766x |
-| static_eager | 50:120 | 20.204 / 27.397 | 1.070 / 1.023 | 28.041 | 1.698x |
+| Decode 实现 | actual R:G SM | alone：Decode/T2V（s） | slowdown：Decode/T2V |
+|---|---:|---:|---:|
+| eager | 10:160 | 33.970 / 22.248 | 1.144 / 1.031 |
+| eager | 18:152 | 30.447 / 23.063 | 1.055 / 1.034 |
+| eager | 34:136 | 29.433 / 25.169 | 1.062 / 1.033 |
+| eager | 50:120 | 29.068 / 27.365 | 1.053 / 1.035 |
+| eager_static (`static_eager`) | 10:160 | 32.343 / 22.249 | 1.153 / 1.028 |
+| eager_static (`static_eager`) | 18:152 | 21.992 / 23.096 | 1.191 / 1.032 |
+| eager_static (`static_eager`) | 34:136 | 20.662 / 25.260 | 1.134 / 1.029 |
+| eager_static (`static_eager`) | 50:120 | 20.204 / 27.397 | 1.070 / 1.023 |
+| graph | 10:160 | 29.727 / 22.355 | 1.148 / 1.024 |
+| graph | 18:152 | 17.765 / 23.098 | 1.204 / 1.029 |
+| graph | 34:136 | 10.603 / 25.254 | 1.170 / 1.016 |
+| graph | 50:120 | 8.395 / 27.461 | 1.207 / 1.013 |
 
-可以直接确认：
+直接观察：
 
-- T2V slowdown 在全部点仅约 1.3%--3.5%；
-- eager decode slowdown 为约 5.3%--14.4%；graph decode 为约 14.8%--20.7%，主要干扰落在 decode 一侧；
-- eager 50:120 最接近平衡，吞吐收益最高 1.843x；
-- graph 在同一 partition 下 decode 已显著缩短，所以 34:136 和 50:120 不再配平，吞吐收益下降不能解释为 graph 共置能力更差；
-- graph 18:152 的 1.720x 是当前表内 graph 较好的折中，但仍不是严格双向配平的全局最优搜索。
-- static_eager 在 18:152 最接近平衡；其 1.721x 与 graph 同分区相同，但两者的绝对构成不同；
-- 在 34-SM Reasoner 点，decode-alone 从原始 eager 的 29.433 s 降至 static_eager 的 20.662 s，再降至 graph 的 10.603 s。这证明 KV/backend 改造和 graph replay 都贡献了显著降时；
-- static_eager 的 T2V slowdown 仍只有 2.3%--3.2%，decode slowdown 为 7.0%--19.1%。
+- T2V slowdown 在全部点约为 1.3%--3.5%，对三种 decode 实现均较稳定；
+- eager decode slowdown 为 5.3%--14.4%；
+- eager_static decode slowdown 为 7.0%--19.1%；
+- graph decode slowdown 为 14.8%--20.7%；
+- slowdown 的非对称性说明主要干扰落在 decode 一侧，但仅凭该表不能把原因唯一归结为 DRAM、SM 竞争或 launch competition。
 
-关于原因只能谨慎表述：T2V 对共置不敏感而 decode 更敏感，与 decode 的小 kernel/访存/调度特征和 T2V 的大 kernel 占用模式相容；仅凭 slowdown 非对称不能证明一定是 DRAM bandwidth。严格归因还需要同区间 Nsys kernel overlap、SM active、DRAM/L2 throughput、eligible warps 和 launch gap 的联合证据。
+### 7.3 T2I × LLM：全部分区的同次共置 slowdown
 
-### 7.3 T2I × LLM
-
-T2I 单次约 1.1 s，无法与一次长 decode 配平。因此矩阵让 Generator worker 串行执行 `N` 次 T2I，使 `N × T2I` 接近该分区的 decode-alone 时间。它测量的是“一次 decode 与一批连续 T2I 的 pipeline overlap”，不是单请求 latency。
+单次 warm T2I 远短于一次 decode，因此 Generator worker 连续执行 `N` 次 T2I。`T2I repeats` 是该矩阵点实际测量的 batch 大小，必须与 slowdown 一起保留。
 
 正式汇总：
 
 ```text
-profiling_results/decode_t2i_impact_matrix/summary_matrix01.csv
 profiling_results/decode_t2i_impact_matrix/summary_all_implementations.csv
 profiling_results/decode_t2i_impact_matrix/*_matrix01.log
 ```
 
-| Decode | actual R:G SM | T2I repeats | alone：Decode/T2I batch（s） | slowdown：Decode/T2I | makespan（s） | throughput gain |
-|---|---:|---:|---:|---:|---:|---:|
-| eager | 10:160 | 31 | 33.998 / 34.059 | 1.812 / 1.444 | 61.595 | 1.105x |
-| eager | 18:152 | 27 | 30.432 / 29.615 | 1.829 / 1.487 | 55.675 | 1.078x |
-| eager | 34:136 | 27 | 29.098 / 29.909 | 1.882 / 1.481 | 54.770 | 1.077x |
-| eager | 50:120 | 25 | 28.922 / 28.454 | 1.808 / 1.444 | 52.282 | 1.097x |
-| graph | 10:160 | 27 | 29.752 / 29.553 | 1.071 / 1.026 | 31.860 | 1.861x |
-| graph | 18:152 | 16 | 17.711 / 17.863 | 1.078 / 1.017 | 19.093 | 1.863x |
-| graph | 34:136 | 10 | 10.576 / 11.432 | 1.092 / 1.040 | 11.892 | 1.851x |
-| graph | 50:120 | 7 | 8.368 / 7.979 | 1.092 / 1.039 | 9.137 | 1.789x |
-| static_eager | 10:160 | 29 | 32.322 / 31.790 | 1.629 / 1.326 | 52.642 | 1.218x |
-| static_eager | 18:152 | 19 | 21.453 / 20.976 | 1.816 / 1.341 | 38.960 | 1.089x |
-| static_eager | 34:136 | 18 | 20.302 / 20.345 | 1.843 / 1.341 | 37.422 | 1.086x |
-| static_eager | 50:120 | 17 | 20.156 / 19.355 | 1.821 / 1.347 | 36.706 | 1.076x |
+| Decode 实现 | actual R:G SM | T2I repeats | alone：Decode/T2I batch（s） | slowdown：Decode/T2I |
+|---|---:|---:|---:|---:|
+| eager | 10:160 | 31 | 33.998 / 34.059 | 1.812 / 1.444 |
+| eager | 18:152 | 27 | 30.432 / 29.615 | 1.829 / 1.487 |
+| eager | 34:136 | 27 | 29.098 / 29.909 | 1.882 / 1.481 |
+| eager | 50:120 | 25 | 28.922 / 28.454 | 1.808 / 1.444 |
+| eager_static (`static_eager`) | 10:160 | 29 | 32.322 / 31.790 | 1.629 / 1.326 |
+| eager_static (`static_eager`) | 18:152 | 19 | 21.453 / 20.976 | 1.816 / 1.341 |
+| eager_static (`static_eager`) | 34:136 | 18 | 20.302 / 20.345 | 1.843 / 1.341 |
+| eager_static (`static_eager`) | 50:120 | 17 | 20.156 / 19.355 | 1.821 / 1.347 |
+| graph | 10:160 | 27 | 29.752 / 29.553 | 1.071 / 1.026 |
+| graph | 18:152 | 16 | 17.711 / 17.863 | 1.078 / 1.017 |
+| graph | 34:136 | 10 | 10.576 / 11.432 | 1.092 / 1.040 |
+| graph | 50:120 | 7 | 8.368 / 7.979 | 1.092 / 1.039 |
 
-可以直接确认：
+直接观察：
 
-- eager 下两侧都受到严重干扰：decode 约 1.81--1.88x，T2I batch 约 1.44--1.49x；吞吐收益仅 1.08--1.11x；
-- graph 下 decode slowdown 降至 1.07--1.09x，T2I batch 降至 1.02--1.04x；吞吐收益达到 1.79--1.86x；
-- static_eager 虽降低了 decode-alone 绝对时间，但 T2I 共置干扰仍接近原始 eager：decode slowdown 为 1.63--1.84x，T2I slowdown 为 1.33--1.35x，吞吐收益仅 1.08--1.22x；
-- 因而 T2I 矩阵把两个因素分开了：static KV/backend 主要改善 standalone decode 绝对时间，而在相同 KV/backend 上加入 CUDA Graph replay，才消除了这组短任务共置中的大部分干扰；
-- 这种差异强烈支持“eager 两个 workload 的 host/driver launch 竞争是重要因素”的解释，因为 CUDA Graph 降低逐 kernel 提交开销后矩阵显著改善；
-- 原先“graph 同时改变 KV/backend，因而不能拆因”的限制已由 static_eager 基线消除：`static_eager -> graph` 保持 static KV、`flash_attn_with_kvcache`、输入、token 数和输出 hash 一致，主要实现变量就是逐 token eager launch 与 CUDA Graph replay；
-- 但“CUDA Graph 是关键变量”仍不等于已经把底层机制全部定量归因于 CPU launch competition。Graph replay 同时改变 host submission、CUDA driver/front-end 调度和 kernel 到达时序；若要继续区分这些机制，仍应对 static_eager 与 graph 的相同共置区间做 Nsys 对照。这个 Nsys 对照是微观机制分析，而不再是建立中间性能基线的前置条件。
+- eager 下 decode slowdown 为 1.81--1.88x，T2I batch slowdown 为 1.44--1.49x；
+- eager_static 下 decode slowdown 为 1.63--1.84x，T2I batch slowdown 为 1.33--1.35x；
+- graph 下 decode slowdown 为 1.07--1.09x，T2I batch slowdown 为 1.02--1.04x；
+- static KV/backend 改善了 standalone decode，但 eager_static 的共置干扰仍明显；在相同 static KV/backend 上加入 CUDA Graph replay 后，双向 slowdown 显著下降；
+- 该结果支持 launch/submission 时序是重要因素，但严格微观归因仍需比较相同区间的 Nsys timeline。
 
 ### 7.4 两个矩阵不能互相直接替代
 
@@ -760,7 +750,7 @@ T2V 是一次较长、连续的 Generator 请求；T2I 矩阵是一批短请求�
 - T2V 矩阵更接近单个长生成任务与一次 decode 的 overlap；
 - T2I 矩阵更接近高频短生成队列与一次 decode 的 throughput overlap；
 - T2I graph 的显著收益不能直接外推到 T2V；
-- 矩阵中的 throughput gain 是同分区串行基线相对共置 makespan，不是相对“两项都独占 full GPU”的系统吞吐。
+- 矩阵中的旧 `throughput_gain_host_wall` 字段实际是同分区串行 host wall 相对共置 host wall的重叠效率，不是相对“两项都独占 full GPU”的系统吞吐；后续输出已改名。
 
 ## 附录 A：结果可信度与历史数据使用规则
 
@@ -802,7 +792,7 @@ profiling_tools/serial_agentic_workflows.py
 profiling_tools/docs/serial_agentic_workflows.md
 
 # 共置与影响矩阵
-profiling_tools/colocate_decode_t2v.py
+profiling_tools/runners/colocate_decode_t2v.py
 profiling_tools/scripts/run_decode_t2v_impact_matrix.sh
 profiling_tools/scripts/run_decode_t2i_impact_matrix.sh
 profiling_tools/analysis/summarize_decode_t2v_impact_matrix.py

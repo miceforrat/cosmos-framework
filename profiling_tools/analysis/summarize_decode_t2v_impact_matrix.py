@@ -14,6 +14,9 @@ PARTITION_RE = re.compile(
 FIELD_RE = re.compile(r"^\s{2}([a-z0-9_]+)=([0-9.]+)(?: s|x)\s*$", re.MULTILINE)
 GENERATOR_REPEATS_RE = re.compile(r"generator_repeats=(\d+)")
 GENERATOR_WORKLOAD_RE = re.compile(r"generator_workload=([a-z0-9_]+)")
+COLOCATED_HOST_WALL_RE = re.compile(
+    r"Colocation result.*?\n\s{2}host_wall=([0-9.]+) s", re.DOTALL
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +51,9 @@ def main() -> None:
             print(f"Skipping incomplete log: {path}")
             continue
         fields = dict(FIELD_RE.findall(text[text.rfind("Balanced interference summary:"):]))
+        colocated_host_wall_matches = COLOCATED_HOST_WALL_RE.findall(text)
+        if not colocated_host_wall_matches:
+            raise ValueError(f"{path}: missing colocated host_wall")
         # New logs use workload-neutral generator_* names. Accept historical
         # T2V logs as aliases so existing experiments remain summarizable.
         for old_name, new_name in (
@@ -57,6 +63,11 @@ def main() -> None:
         ):
             if new_name not in fields and old_name in fields:
                 fields[new_name] = fields[old_name]
+        # Normalize renamed fields while retaining compatibility with historical logs.
+        if "partition_serial_host_wall" in fields and "serial_host_wall" not in fields:
+            fields["serial_host_wall"] = fields["partition_serial_host_wall"]
+        if "partition_overlap_efficiency_host_wall" in fields and "throughput_gain_host_wall" not in fields:
+            fields["throughput_gain_host_wall"] = fields["partition_overlap_efficiency_host_wall"]
         required = {
             "decode_alone",
             "decode_colocated",
@@ -98,6 +109,7 @@ def main() -> None:
             "total_sm": total,
         }
         row.update({name: float(fields[name]) for name in sorted(required)})
+        row["colocated_host_wall"] = float(colocated_host_wall_matches[-1])
         row["alone_time_gap_s"] = abs(
             float(fields["decode_alone"]) - float(fields["generator_alone"])
         )
@@ -109,7 +121,8 @@ def main() -> None:
 
     if not rows:
         raise SystemExit(f"No completed logs found in {args.input_dir}")
-    rows.sort(key=lambda row: (str(row["implementation"]), int(row["actual_reasoner_sm"])))
+    implementation_order = {"eager": 0, "static_eager": 1, "graph": 2}
+    rows.sort(key=lambda row: (implementation_order.get(str(row["implementation"]), 99), int(row["actual_reasoner_sm"])))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -124,7 +137,6 @@ def main() -> None:
                 "R{actual_reasoner_sm:>3}/G{actual_generator_sm:>3} "
                 "alone={decode_alone:.3f}/{generator_alone:.3f}s "
                 "slowdown={decode_slowdown:.3f}/{generator_slowdown:.3f}x "
-                "throughput={throughput_gain_host_wall:.3f}x"
             ).format(**row)
         )
 

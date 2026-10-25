@@ -2193,6 +2193,22 @@ def _reasoner_cuda_graph_decode(
         # torch.cuda.stream(gc_external_stream).  Capture explicitly on the
         # current GC stream so every replay retains the SM partition.
         capture_stream = torch.cuda.current_stream()
+        capture_stream_ptr = int(capture_stream.cuda_stream)
+        from cosmos_framework.runtime.regions import expected_cuda_stream_ptr
+
+        expected_stream_ptr = expected_cuda_stream_ptr()
+        if expected_stream_ptr is not None and capture_stream_ptr != expected_stream_ptr:
+            raise RuntimeError(
+                "Reasoner CUDA Graph capture is not using the stream selected "
+                "by the runtime region: "
+                f"expected=0x{expected_stream_ptr:x}, "
+                f"actual=0x{capture_stream_ptr:x}"
+            )
+        log.info(
+            f"[reasoner_cuda_graph] capture stream: actual=0x{capture_stream_ptr:x} "
+            f"expected={'none' if expected_stream_ptr is None else f'0x{expected_stream_ptr:x}'} "
+            f"verified={expected_stream_ptr is not None and capture_stream_ptr == expected_stream_ptr}"
+        )
         with torch.cuda.graph(
             graph,
             stream=capture_stream,

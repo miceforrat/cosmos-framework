@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import hashlib
+import json
 import time
 import functools
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +18,9 @@ import torch
 import tyro
 
 from cosmos_framework.runtime.regions import (
+    install_expected_cuda_stream_ptr,
     install_region_factory,
+    reset_expected_cuda_stream_ptr,
     reset_region_factory,
 )
 from profiling_tools.core.green_context import GreenContextPair
@@ -127,10 +131,14 @@ class DecodeRegionController:
                 self.host_start_s = time.perf_counter()
                 assert self.start_event is not None
                 self.start_event.record(self.stream)
+            expected_stream_token = install_expected_cuda_stream_ptr(
+                int(self.stream.cuda_stream)
+            )
             try:
                 with nvtx_range(self.nvtx_range_name):
                     yield
             finally:
+                reset_expected_cuda_stream_ptr(expected_stream_token)
                 current_end_event.record(self.stream)
                 self.end_event = current_end_event
                 if self.measure_host_region:
@@ -489,7 +497,8 @@ def run_reasoner_alone(
     nvtx_range_name: str = "reasoner_decode_alone",
     stream: torch.cuda.Stream | None = None,
     display_name: str = "Partitioned-alone decode",
-) -> tuple[float, float]:
+    emit_result: bool = True,
+) -> tuple[float, float, float, float]:
     decode_stream = resources.reasoner_stream if stream is None else stream
     controller = DecodeRegionController(
         stream=decode_stream,
@@ -522,12 +531,13 @@ def run_reasoner_alone(
     controller.end_event.synchronize()
     host_seconds = controller.host_end_s - controller.host_start_s
     seconds = controller.start_event.elapsed_time(controller.end_event) / 1000.0
-    print(
-        f"\n{display_name} ({reasoner_repeats} requests): "
-        f"gpu={seconds:.3f} s host_region={host_seconds:.3f} s",
-        flush=True,
-    )
-    return seconds, host_seconds
+    if emit_result:
+        print(
+            f"\n{display_name} ({reasoner_repeats} requests): "
+            f"gpu={seconds:.3f} s host_region={host_seconds:.3f} s",
+            flush=True,
+        )
+    return seconds, host_seconds, controller.host_start_s, controller.host_end_s
 
 
 def run_generator_alone(
@@ -536,14 +546,18 @@ def run_generator_alone(
     resources: ColocationResources,
     generator_region: str,
     generator_repeats: int,
-) -> tuple[float, float | None, float]:
+    stream: torch.cuda.Stream | None = None,
+    display_name: str = "Partitioned-alone generator",
+    emit_result: bool = True,
+) -> tuple[float, float | None, float, float, float]:
+    generator_stream = resources.generator_stream if stream is None else stream
     stage_controller = None if generator_region == "full" else GeneratorStageController(generator_region, None)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     wrapper_context = nullcontext() if stage_controller is None else install_generator_stage_wrappers(stage_controller)
-    with wrapper_context, torch.cuda.stream(resources.generator_stream):
+    with wrapper_context, torch.cuda.stream(generator_stream):
         host_start_s = time.perf_counter()
-        start.record(resources.generator_stream)
+        start.record(generator_stream)
         output = None
         for _ in range(generator_repeats):
             sample_args, data_batch = workloads.fresh_generator_batch()
@@ -552,20 +566,22 @@ def run_generator_alone(
                 data_batch,
                 save_outputs=False,
             )
-        end.record(resources.generator_stream)
+        end.record(generator_stream)
     end.synchronize()
-    host_seconds = time.perf_counter() - host_start_s
+    host_end_s = time.perf_counter()
+    host_seconds = host_end_s - host_start_s
     del output
     seconds = start.elapsed_time(end) / 1000.0
-    print(
-        f"Partitioned-alone generator ({generator_repeats} requests): "
-        f"gpu={seconds:.3f} s host_region={host_seconds:.3f} s",
-        flush=True,
-    )
+    if emit_result:
+        print(
+            f"{display_name} ({generator_repeats} requests): "
+            f"gpu={seconds:.3f} s host_region={host_seconds:.3f} s",
+            flush=True,
+        )
     stage_seconds = stage_controller.elapsed_seconds() if stage_controller is not None else None
     if stage_seconds is not None:
         print(f"Partitioned-alone {generator_region}: {stage_seconds:.3f} s", flush=True)
-    return seconds, stage_seconds, host_seconds
+    return seconds, stage_seconds, host_seconds, host_start_s, host_end_s
 
 
 def main() -> None:
@@ -576,14 +592,16 @@ def main() -> None:
     generator_region = os.environ.get("COSMOS_COLOCATE_GENERATOR_REGION", "full")
     generator_workload = os.environ.get("COSMOS_GENERATOR_WORKLOAD", "t2v")
     full_sm_decode_only = os.environ.get("COSMOS_FULL_SM_DECODE_ONLY") == "1"
+    full_sm_generator_only = os.environ.get("COSMOS_FULL_SM_GENERATOR_ONLY") == "1"
+    full_sm_serial_only = os.environ.get("COSMOS_FULL_SM_SERIAL_BASELINE_ONLY") == "1"
     gc_decode_only = os.environ.get("COSMOS_GC_DECODE_ONLY") == "1"
     use_cuda_graph = os.environ.get("COSMOS_REASONER_CUDA_GRAPH") == "1"
     use_static_kv_eager = os.environ.get("COSMOS_REASONER_STATIC_KV_EAGER") == "1"
     if use_cuda_graph and use_static_kv_eager:
         raise ValueError("COSMOS_REASONER_CUDA_GRAPH and COSMOS_REASONER_STATIC_KV_EAGER are mutually exclusive")
     decode_implementation = "graph" if use_cuda_graph else "static_eager" if use_static_kv_eager else "eager"
-    if full_sm_decode_only and gc_decode_only:
-        raise ValueError("COSMOS_FULL_SM_DECODE_ONLY and COSMOS_GC_DECODE_ONLY are mutually exclusive")
+    if sum((full_sm_decode_only, full_sm_generator_only, full_sm_serial_only, gc_decode_only)) > 1:
+        raise ValueError("COSMOS_FULL_SM_DECODE_ONLY, COSMOS_FULL_SM_GENERATOR_ONLY, COSMOS_FULL_SM_SERIAL_BASELINE_ONLY, and COSMOS_GC_DECODE_ONLY are mutually exclusive")
     if generator_region not in {"full", "diffusion_sampling", "vae_decode"}:
         raise ValueError("COSMOS_COLOCATE_GENERATOR_REGION must be full, diffusion_sampling, or vae_decode")
     if reasoner_repeats <= 0 or generator_repeats <= 0 or warmup_runs < 0:
@@ -622,6 +640,71 @@ def main() -> None:
         output_dir=output_dir,
         checkpoint_path="Cosmos3-Edge",
     )
+
+    reasoner_input_data = json.loads(reasoner_input.read_text(encoding="utf-8"))
+    prompt_token_ids = workloads.pipe.model.tokenize_text(
+        reasoner_input_data["prompt"], device=None
+    ).reshape(-1).tolist()
+    prompt_token_ids_json = json.dumps(prompt_token_ids, separators=(",", ":"))
+    generator_sample = workloads.generator_sample_args.model_dump(mode="json")
+    generator_prompt = generator_sample["prompt"]
+    resolution_payload = json.loads(generator_prompt).get("resolution", {})
+    canonical_generator_workload = {
+        "prompt": generator_prompt,
+        "negative_prompt": generator_sample["negative_prompt"],
+        "height": int(resolution_payload["H"]),
+        "width": int(resolution_payload["W"]),
+        "num_frames": int(generator_sample["num_frames"]),
+        "num_inference_steps": int(generator_sample["num_steps"]),
+        "guidance_scale": float(generator_sample["guidance"]),
+        "flow_shift": float(generator_sample["shift"]),
+        "seed": int(generator_sample["seed"]),
+    }
+    canonical_generator_json = json.dumps(
+        canonical_generator_workload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    workload_identity = {
+        "reasoner": {
+            "raw_prompt_sha256": hashlib.sha256(
+                reasoner_input_data["prompt"].encode("utf-8")
+            ).hexdigest(),
+            "prompt_token_count": len(prompt_token_ids),
+            "prompt_token_ids_sha256": hashlib.sha256(
+                prompt_token_ids_json.encode("utf-8")
+            ).hexdigest(),
+            "fixed_completion_tokens": int(reasoner_input_data["max_new_tokens"]),
+        },
+        "generator": {
+            "canonical_workload": canonical_generator_workload,
+            "canonical_workload_sha256": hashlib.sha256(
+                canonical_generator_json.encode("utf-8")
+            ).hexdigest(),
+            "prompt_sha256": hashlib.sha256(
+                generator_prompt.encode("utf-8")
+            ).hexdigest(),
+            "negative_prompt_sha256": hashlib.sha256(
+                generator_sample["negative_prompt"].encode("utf-8")
+            ).hexdigest(),
+        },
+    }
+    workload_identity_path = output_dir / "matched_workload_identity.json"
+    workload_identity_path.parent.mkdir(parents=True, exist_ok=True)
+    workload_identity_path.write_text(
+        json.dumps(workload_identity, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        "Matched workload identity:",
+        f"reasoner_prompt_tokens={len(prompt_token_ids)}",
+        f"reasoner_token_hash={workload_identity['reasoner']['prompt_token_ids_sha256']}",
+        f"generator_hash={workload_identity['generator']['canonical_workload_sha256']}",
+        f"manifest={workload_identity_path}",
+        flush=True,
+    )
+
     resources = ColocationResources(
         generator_sm_count=requested_generator_sm_count,
         device=0,
@@ -655,7 +738,7 @@ def main() -> None:
                 display_name=f"Full-SM {decode_implementation} prime",
             )
             with nvtx_range("NSYS_REASONER_FULL_SM_ALONE"):
-                full_sm_s, _ = run_reasoner_alone(
+                full_sm_s, full_sm_host_s, _, _ = run_reasoner_alone(
                     workloads=workloads,
                     resources=resources,
                     reasoner_repeats=reasoner_repeats,
@@ -663,7 +746,97 @@ def main() -> None:
                     stream=full_sm_stream,
                     display_name="Full-SM decode",
                 )
-            print(f"\nFull-SM decode baseline: {full_sm_s:.3f} s", flush=True)
+            print(f"\nFull-SM decode baseline: gpu={full_sm_s:.3f} s host_wall={full_sm_host_s:.3f} s", flush=True)
+            return
+
+        if full_sm_generator_only:
+            full_sm_stream = torch.cuda.Stream(device=resources.owner.device)
+            print(f"Priming full-SM {generator_workload} generator...", flush=True)
+            run_generator_alone(
+                workloads=workloads,
+                resources=resources,
+                generator_region=generator_region,
+                generator_repeats=1,
+                stream=full_sm_stream,
+                display_name="Full-SM generator prime",
+            )
+            with nvtx_range("NSYS_GENERATOR_FULL_SM_ALONE"):
+                full_sm_s, full_sm_stage_s, full_sm_host_s, _, _ = run_generator_alone(
+                    workloads=workloads,
+                    resources=resources,
+                    generator_region=generator_region,
+                    generator_repeats=generator_repeats,
+                    stream=full_sm_stream,
+                    display_name="Full-SM generator",
+                )
+            print(
+                "\nFull-SM generator baseline:",
+                f"workload={generator_workload}",
+                f"repeats={generator_repeats}",
+                f"gpu={full_sm_s:.3f} s",
+                f"host_wall={full_sm_host_s:.3f} s",
+                flush=True,
+            )
+            if full_sm_stage_s is not None:
+                print(f"Full-SM {generator_region}: {full_sm_stage_s:.3f} s", flush=True)
+            return
+
+        if full_sm_serial_only:
+            full_sm_stream = torch.cuda.Stream(device=resources.owner.device)
+            print(
+                f"Priming matched full-SM serial baseline ({decode_implementation} + "
+                f"{generator_workload} x{generator_repeats})...",
+                flush=True,
+            )
+            run_reasoner_alone(
+                workloads=workloads,
+                resources=resources,
+                reasoner_repeats=1,
+                nvtx_range_name="reasoner_decode_full_sm_serial_prime",
+                stream=full_sm_stream,
+                display_name="Full-SM serial decode prime",
+            )
+            run_generator_alone(
+                workloads=workloads,
+                resources=resources,
+                generator_region=generator_region,
+                generator_repeats=1,
+                stream=full_sm_stream,
+                display_name="Full-SM serial generator prime",
+            )
+            with nvtx_range("NSYS_FULL_SM_SERIAL_BASELINE"):
+                decode_s, decode_host_s, serial_start_s, _ = run_reasoner_alone(
+                    workloads=workloads,
+                    resources=resources,
+                    reasoner_repeats=reasoner_repeats,
+                    nvtx_range_name="reasoner_decode_full_sm_serial",
+                    stream=full_sm_stream,
+                    emit_result=False,
+                )
+                generator_s, generator_stage_s, generator_host_s, _, serial_end_s = run_generator_alone(
+                    workloads=workloads,
+                    resources=resources,
+                    generator_region=generator_region,
+                    generator_repeats=generator_repeats,
+                    stream=full_sm_stream,
+                    emit_result=False,
+                )
+            serial_host_wall_s = serial_end_s - serial_start_s
+            print(
+                "\nFull-SM serial baseline:",
+                f"\n  decode_implementation={decode_implementation}",
+                f"\n  generator_workload={generator_workload}",
+                f"\n  generator_repeats={generator_repeats}",
+                f"\n  decode_gpu={decode_s:.3f} s",
+                f"\n  decode_host_region={decode_host_s:.3f} s",
+                f"\n  generator_gpu={generator_s:.3f} s",
+                f"\n  generator_host_region={generator_host_s:.3f} s",
+                f"\n  transition_and_python_overhead={serial_host_wall_s - decode_host_s - generator_host_s:.6f} s",
+                f"\n  full_sm_serial_host_wall={serial_host_wall_s:.3f} s",
+                flush=True,
+            )
+            if generator_stage_s is not None:
+                print(f"  {generator_region}={generator_stage_s:.3f} s", flush=True)
             return
 
         if gc_decode_only:
@@ -676,7 +849,7 @@ def main() -> None:
                 display_name="GC graph prime",
             )
             with nvtx_range("NSYS_REASONER_GC_ALONE"):
-                gc_decode_s, _ = run_reasoner_alone(
+                gc_decode_s, _, _, _ = run_reasoner_alone(
                     workloads=workloads,
                     resources=resources,
                     reasoner_repeats=reasoner_repeats,
@@ -715,13 +888,13 @@ def main() -> None:
         with nsys_capture():
             serial_end_to_end_start = time.perf_counter()
             with nvtx_range("NSYS_REASONER_ALONE"):
-                alone_reasoner_s, alone_reasoner_host_s = run_reasoner_alone(
+                alone_reasoner_s, alone_reasoner_host_s, _, _ = run_reasoner_alone(
                     workloads=workloads,
                     resources=resources,
                     reasoner_repeats=reasoner_repeats,
                 )
             with nvtx_range("NSYS_GENERATOR_ALONE"):
-                alone_generator_s, alone_stage_s, alone_generator_host_s = run_generator_alone(
+                alone_generator_s, alone_stage_s, alone_generator_host_s, _, _ = run_generator_alone(
                     workloads=workloads,
                     resources=resources,
                     generator_region=generator_region,
@@ -762,11 +935,11 @@ def main() -> None:
             f"\n  generator_colocated={coloc_generator_s:.3f} s",
             f"\n  generator_slowdown={coloc_generator_s / alone_generator_s:.3f}x",
             f"\n  serial_gpu_sum={serial_gpu_sum_s:.3f} s",
-            f"\n  serial_host_wall={serial_host_wall_s:.3f} s",
+            f"\n  partition_serial_host_wall={serial_host_wall_s:.3f} s",
             f"\n  serial_end_to_end_wall_diagnostic={serial_end_to_end_wall_s:.3f} s",
             f"\n  colocated_makespan={makespan_s:.3f} s",
             f"\n  throughput_gain_gpu_sum={serial_gpu_sum_s / makespan_s:.3f}x",
-            f"\n  throughput_gain_host_wall={serial_host_wall_s / coloc_wall_s:.3f}x",
+            f"\n  partition_overlap_efficiency_host_wall={serial_host_wall_s / coloc_wall_s:.3f}x",
             flush=True,
         )
         if alone_stage_s is not None and coloc_stage_s is not None:
